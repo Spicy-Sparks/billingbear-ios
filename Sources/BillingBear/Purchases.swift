@@ -14,6 +14,26 @@ public struct PurchaseResult: Sendable {
     public let customerInfo: CustomerInfo
     public let productId: String
     public let transactionId: String?
+    /// The store transaction the purchase produced (validated with BillingBear and finished).
+    public let transaction: StoreTransaction?
+    /// For a consumable or non-consumable: BillingBear's record of it — granted, already recorded,
+    /// revoked by the store, transferred from another subscriber, or kept by its original owner. Nil
+    /// for subscriptions, and when the transaction had already been validated before this call.
+    public let nonSubscriptionRecord: NonSubscriptionPurchaseResult?
+
+    public init(
+        customerInfo: CustomerInfo,
+        productId: String,
+        transactionId: String?,
+        transaction: StoreTransaction? = nil,
+        nonSubscriptionRecord: NonSubscriptionPurchaseResult? = nil
+    ) {
+        self.customerInfo = customerInfo
+        self.productId = productId
+        self.transactionId = transactionId
+        self.transaction = transaction
+        self.nonSubscriptionRecord = nonSubscriptionRecord
+    }
 }
 
 // MARK: - Speed-layer configuration
@@ -83,6 +103,10 @@ public struct CachedPaywallResult: Sendable {
 /// Mirrors the React Native `Purchases` API: anonymous-first user management (the anonymous
 /// appUserId is persisted in `UserDefaults`), entitlement lookups, login/logout, web checkout,
 /// and StoreKit 2 purchases whose transactions are validated against the backend.
+///
+/// The purchase core (see `Purchases+Transactions.swift`) also listens to `Transaction.updates` from
+/// `configure`, replays unfinished transactions at launch and on every foreground, and publishes every
+/// customer-info change to `customerInfoStream` and `delegate`.
 public actor Purchases {
 
     // MARK: Singleton
@@ -92,12 +116,63 @@ public actor Purchases {
 
     // MARK: State
 
-    private var api: BillingBearAPI?
-    private var _appUserId: String = ""
+    var api: BillingBearAPI?
+    var _appUserId: String = ""
     private var isAnonymousUser: Bool = true
-    private let defaults: UserDefaults
+    let defaults: UserDefaults
 
     static let anonymousIdKey = "com.billingbear.anonymousAppUserId"
+    static let customerInfoCacheKey = "com.billingbear.customerInfoCache"
+
+    // MARK: Purchase core state (used by the Purchases+*.swift extensions)
+
+    /// The store layer. `StoreKit2Client.shared` in apps; a mock in tests.
+    var store: (any StoreKitClient)?
+    var options = PurchasesOptions()
+    /// Bumped by every configure: work started under an older configuration never writes state.
+    var configurationEpoch = 0
+    /// Bumped by every identity change (login, logout, reconfigure as someone else).
+    var identityEpoch = 0
+    /// Bumped by every authoritative customer-info write; a read that started before it is discarded.
+    var customerInfoGeneration = 0
+    /// What the current subscriber is shown: the last server answer, or a provisional offline value
+    /// laid over it.
+    var cachedCustomerInfo: CustomerInfo?
+    /// The last answer the SERVER gave for the current subscriber (never a provisional value), and when.
+    /// Freshness, the offline window and every fallback are measured from this, so a provisional grant
+    /// can never stand in for a server answer.
+    var serverCustomerInfo: CustomerInfo?
+    var serverCustomerInfoFetchedAt: Date?
+    /// The customer-info read in flight, shared by concurrent callers of the same generation.
+    var customerInfoRead: (generation: Int, task: Task<CustomerInfo, Error>)?
+    /// Transaction revisions being validated right now (keyed by configuration + revision), so a second
+    /// delivery of the same revision joins the first.
+    var transactionTasks: [String: Task<TransactionSyncOutcome, Error>] = [:]
+    /// Transaction revisions completed this configuration, oldest first, bounded. A revision is the
+    /// transaction id plus its revocation/upgrade state: a refund of a processed purchase is new work.
+    var processedTransactionIds: [String] = []
+    var processedTransactionIdSet: Set<String> = []
+    /// BillingBear's one-time record of a completed revision (bounded with `processedTransactionIds`),
+    /// and whether it was sent as an explicit purchase.
+    var processedOneTimeRecords: [String: ProcessedOneTimeRecord] = [:]
+    /// A one-time purchase was recorded but the entitlement read after it failed: the cached customer
+    /// info predates it, so the next read asks BillingBear whatever the TTL says.
+    var customerInfoOutdated = false
+    /// The latest work queued per transaction id (configuration-scoped), so revisions run in order.
+    var transactionChains: [String: Task<Void, Never>] = [:]
+    /// Transactions whose refund has been seen this configuration.
+    var revokedTransactionIds: Set<String> = []
+    var retryAttempts: [String: Int] = [:]
+    var retryTasks: [String: Task<Void, Never>] = [:]
+    /// The single `Transaction.updates` listener, and the store it listens to.
+    var transactionListener: Task<Void, Never>?
+    var transactionListenerStore: ObjectIdentifier?
+    var purchaseForegroundObserver: NSObjectProtocol?
+    /// Test seams.
+    var now: @Sendable () -> Date = { Date() }
+    var retrySleep: @Sendable (UInt64) async -> Void = { try? await Task.sleep(nanoseconds: $0) }
+    /// Fans customer-info changes out to `customerInfoStream` and `delegate`.
+    nonisolated let broadcaster = CustomerInfoBroadcaster()
 
     // MARK: Speed layer
 
@@ -127,13 +202,19 @@ public actor Purchases {
     }
 
     deinit {
-        // Release the foreground observer if one was registered. (NotificationCenter holds the token,
+        // Release the foreground observers if registered. (NotificationCenter holds the token,
         // not self; removing here avoids a dangling block after the actor is gone.)
         #if canImport(UIKit)
         if let observer = foregroundObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        if let observer = purchaseForegroundObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         #endif
+        transactionListener?.cancel()
+        retryTasks.values.forEach { $0.cancel() }
+        broadcaster.finishAll()
     }
 
     // MARK: Configure
@@ -145,6 +226,10 @@ public actor Purchases {
     /// The SPEED LAYER is configured here too (additive — existing callers get the defaults): after
     /// configure the SDK prefetches `speed.prefetchIdentifiers` + offerings in the background and
     /// re-prefetches on every app-foreground, persisting them so `present` paints from cache instantly.
+    ///
+    /// The PURCHASE CORE starts here as well: the `Transaction.updates` listener (one per process, kept
+    /// across reconfigures), the replay of unfinished transactions, a customer-info refresh when the
+    /// cache is stale, and the foreground hook that repeats the replay. `options` tunes it.
     public func configure(
         apiKey: String,
         appUserId: String? = nil,
@@ -153,30 +238,107 @@ public actor Purchases {
         speed: SpeedLayerConfig = .init(),
         country: String? = nil
     ) {
-        self.api = BillingBearAPI(apiKey: apiKey, baseURL: baseURL, bundleId: bundleId ?? Bundle.main.bundleIdentifier)
+        configure(apiKey: apiKey, appUserId: appUserId, baseURL: baseURL, bundleId: bundleId, speed: speed, country: country, options: PurchasesOptions())
+    }
+
+    /// `configure(apiKey:…)` with explicit purchase-core options.
+    public func configure(
+        apiKey: String,
+        appUserId: String? = nil,
+        baseURL: String = "https://api.billingbear.io",
+        bundleId: String? = nil,
+        speed: SpeedLayerConfig = .init(),
+        country: String? = nil,
+        options: PurchasesOptions
+    ) {
+        let api = BillingBearAPI(apiKey: apiKey, baseURL: baseURL, bundleId: bundleId ?? Bundle.main.bundleIdentifier)
         // Namespace the on-device cache by the API key so two projects/keys can't collide.
         self.cache = PaywallCache(store: FilePaywallCacheStore(), project: apiKey)
         self.speed = speed
         self.prefetchCountry = country
-        applyIdentity(appUserId)
+        applyPurchaseConfiguration(api: api, appUserId: appUserId, options: options, store: StoreKit2Client.shared)
         startSpeedLayer()
+        startTransactionObservation(refreshCustomerInfo: true)
     }
 
     /// Test/advanced seam: configure with an explicit API client (e.g. one backed by a mocked
     /// URLSession) and, optionally, an explicit cache (e.g. a temp-dir + fixed-clock store). The
     /// foreground observer is NOT registered here so headless tests stay deterministic; call
-    /// `prefetch()` directly instead.
+    /// `prefetch()` directly instead. StoreKit transactions are observed only with
+    /// `observeTransactions: true` (do that in an app that configures through this seam).
     public func configure(
         api: BillingBearAPI,
         appUserId: String? = nil,
         cache: PaywallCache? = nil,
         speed: SpeedLayerConfig = .init()
     ) {
-        self.api = api
+        configure(api: api, appUserId: appUserId, cache: cache, speed: speed, options: PurchasesOptions(), observeTransactions: false)
+    }
+
+    /// The seam above with purchase-core options; `observeTransactions: true` starts the StoreKit
+    /// listener, the unfinished replay and the foreground hook, as `configure(apiKey:…)` does.
+    public func configure(
+        api: BillingBearAPI,
+        appUserId: String? = nil,
+        cache: PaywallCache? = nil,
+        speed: SpeedLayerConfig = .init(),
+        options: PurchasesOptions,
+        observeTransactions: Bool = false
+    ) {
         self.cache = cache
         self.speed = speed
-        applyIdentity(appUserId)
+        applyPurchaseConfiguration(api: api, appUserId: appUserId, options: options, store: StoreKit2Client.shared)
+        if observeTransactions { startTransactionObservation(refreshCustomerInfo: true) }
     }
+
+    /// Test seam: an explicit store layer and clock.
+    func configure(
+        api: BillingBearAPI,
+        store: any StoreKitClient,
+        appUserId: String? = nil,
+        options: PurchasesOptions = .init(),
+        now: @escaping @Sendable () -> Date = { Date() },
+        retrySleep: @escaping @Sendable (UInt64) async -> Void = { _ in },
+        observeTransactions: Bool = true
+    ) {
+        self.now = now
+        self.retrySleep = retrySleep
+        self.speed = SpeedLayerConfig(prefetchEnabled: false)
+        applyPurchaseConfiguration(api: api, appUserId: appUserId, options: options, store: store)
+        if observeTransactions { startTransactionObservation(refreshCustomerInfo: false) }
+    }
+
+    /// Shared by every configure: install the client, the identity and the options, invalidate work
+    /// started under the previous configuration, and restore this subscriber's persisted customer info.
+    private func applyPurchaseConfiguration(
+        api: BillingBearAPI,
+        appUserId: String?,
+        options: PurchasesOptions,
+        store: any StoreKitClient
+    ) {
+        let previousSubscriber = "\(apiNamespace ?? "-")|\(_appUserId)"
+        // Only when given: a provider set on the client directly survives a configure without one.
+        if let provider = options.endUserTokenProvider { api.endUserTokenProvider = provider }
+        self.api = api
+        self.options = options
+        self.store = store
+        configurationEpoch += 1
+        applyIdentity(appUserId)
+        let subscriberChanged = previousSubscriber != "\(apiNamespace ?? "-")|\(_appUserId)"
+        // A new configuration may be another project: nothing validated under the old one counts, and
+        // its pending retries belong to it.
+        processedTransactionIds.removeAll()
+        processedTransactionIdSet.removeAll()
+        processedOneTimeRecords.removeAll()
+        revokedTransactionIds.removeAll()
+        retryTasks.values.forEach { $0.cancel() }
+        retryTasks.removeAll()
+        retryAttempts.removeAll()
+        resetCustomerInfoForNewSubscriber(subscriberChanged: subscriberChanged)
+    }
+
+    /// The API client's identity, so a persisted customer info is only reused for the same project.
+    var apiNamespace: String? { api?.cacheNamespace }
 
     private func applyIdentity(_ appUserId: String?) {
         if let appUserId, !appUserId.isEmpty {
@@ -193,7 +355,7 @@ public actor Purchases {
     public var appUserId: String { _appUserId }
     public var isAnonymous: Bool { isAnonymousUser }
 
-    private func requireApi() throws -> BillingBearAPI {
+    func requireApi() throws -> BillingBearAPI {
         guard let api else {
             throw PurchasesError("Purchases not configured. Call configure(apiKey:) first.", code: .notConfigured)
         }
@@ -210,12 +372,6 @@ public actor Purchases {
     }
 
     // MARK: Entitlements
-
-    /// Fetch the current customer info from the backend.
-    public func customerInfo() async throws -> CustomerInfo {
-        let api = try requireApi()
-        return try await api.fetchEntitlements(appUserId: _appUserId)
-    }
 
     /// Whether the user currently has premium access.
     public func isPremium() async throws -> Bool {
@@ -235,9 +391,8 @@ public actor Purchases {
     public func login(_ identifiedAppUserId: String) async throws -> CustomerInfo {
         let api = try requireApi()
         let resolved = try await api.login(anonymousAppUserId: _appUserId, identifiedAppUserId: identifiedAppUserId)
-        self._appUserId = resolved
-        self.isAnonymousUser = false
-        return try await api.fetchEntitlements(appUserId: resolved)
+        switchIdentity(to: resolved, anonymous: false)
+        return try await customerInfo(fetchPolicy: .fetchCurrent)
     }
 
     /// Log out the identified user and revert to a fresh anonymous id (persisted to UserDefaults).
@@ -245,10 +400,20 @@ public actor Purchases {
     public func logout() async throws -> CustomerInfo {
         let api = try requireApi()
         let newAnon = try await api.logout(appUserId: _appUserId)
-        self._appUserId = newAnon
-        self.isAnonymousUser = true
         defaults.set(newAnon, forKey: Self.anonymousIdKey)
-        return try await api.fetchEntitlements(appUserId: newAnon)
+        switchIdentity(to: newAnon, anonymous: true)
+        return try await customerInfo(fetchPolicy: .fetchCurrent)
+    }
+
+    /// A different subscriber from here on: nothing cached or in flight for the previous one applies.
+    private func switchIdentity(to appUserId: String, anonymous: Bool) {
+        self._appUserId = appUserId
+        self.isAnonymousUser = anonymous
+        // Retries belong to the previous subscriber's session.
+        retryTasks.values.forEach { $0.cancel() }
+        retryTasks.removeAll()
+        retryAttempts.removeAll()
+        resetCustomerInfoForNewSubscriber(subscriberChanged: true)
     }
 
     // MARK: Checkout
@@ -332,10 +497,31 @@ public actor Purchases {
     // MARK: Placements (Superwall-style triggers)
 
     /// Register a placement (named app event) and ask the backend whether to show a paywall.
-    /// When `present` is true, fetch the paywall with `getPaywall(decision.paywallIdentifier)`.
+    /// When `present` is true, render it with `BillingBearPaywall(decision:)`: that view sells the
+    /// decision's `offeringIdentifier` (an offering experiment's variant, else the placement's default
+    /// offering) through `onPurchaseRequest(_:)`, and folds its `viewed` into the one the evaluation
+    /// recorded (`presentationId`) instead of counting the presentation twice.
     public func register(_ placement: String) async throws -> CampaignDecision {
         let api = try requireApi()
         return try await api.evaluatePlacement(placement: placement, appUserId: _appUserId)
+    }
+
+    /// The offering to show for a placement — RevenueCat's `getCurrentOffering(forPlacement:)`, for
+    /// hosts that draw their own purchase UI. Evaluates the placement: when the decision names an
+    /// offering (the offering-experiment variant the customer is enrolled in, or the placement's
+    /// default offering) that offering is returned. Otherwise — older servers, or a placement without
+    /// an offering — the current offering when the decision presents, else nil (no rule matched: show
+    /// your default UX). Like `register(_:)`, a presenting evaluation counts as a placement view.
+    public func currentOffering(forPlacement placement: String) async throws -> RemoteOffering? {
+        let decision = try await register(placement)
+        let named = decision.offeringIdentifier.flatMap { $0.isEmpty ? nil : $0 }
+        guard named != nil || decision.present else { return nil }
+        let offerings = try await getOfferings()
+        if let named, let offering = offerings.offerings.first(where: { $0.identifier == named }) {
+            return offering
+        }
+        guard decision.present, let current = offerings.currentOfferingId else { return nil }
+        return offerings.offerings.first { $0.identifier == current }
     }
 
     // MARK: Paywalls
@@ -356,12 +542,15 @@ public actor Purchases {
         )
     }
 
-    /// Record a paywall lifecycle event (`viewed` / `dismissed` / `purchased`). Fire-and-forget.
+    /// Record a paywall lifecycle event (`viewed` / `dismissed` / `purchased`, or an exit offer's
+    /// `exit_offer_*` on its source paywall). Fire-and-forget. `presentationId` names the placement
+    /// presentation a `viewed` belongs to (see `BillingBearAPI.recordExposure`).
     public func recordExposure(
         identifier: String,
         outcome: PaywallExposureOutcome,
         experimentId: String? = nil,
-        variant: String? = nil
+        variant: String? = nil,
+        presentationId: String? = nil
     ) async {
         guard let api else { return }
         await api.recordExposure(
@@ -369,7 +558,8 @@ public actor Purchases {
             outcome: outcome,
             appUserId: _appUserId,
             experimentId: experimentId,
-            variant: variant
+            variant: variant,
+            presentationId: presentationId
         )
     }
 
@@ -644,90 +834,67 @@ public actor Purchases {
 
     // MARK: StoreKit 2 purchase
 
-    /// Purchase a StoreKit 2 `StoreKit.Product`, then send the verified transaction to the
-    /// backend's /subscription/confirm endpoint and return the refreshed customer info.
+    /// Purchase a StoreKit 2 `StoreKit.Product`, then send the verified transaction to BillingBear
+    /// (`/subscription/confirm` for subscriptions, `/v1/subscribers/{id}/non-subscription` for one-time
+    /// products), finish it, and return the refreshed customer info.
     ///
-    /// Throws `PurchasesError(.userCancelled)` if the user cancels, `.paymentPending` for
-    /// deferred purchases, and `.storeError` for unverified transactions.
+    /// Throws `PurchasesError(.userCancelled)` if the user cancels, `.paymentPending` for Ask to Buy /
+    /// deferred purchases (they complete later through `Transaction.updates`: watch `customerInfoStream`
+    /// or the delegate), and `.storeError` for unverified transactions. When validation fails the
+    /// transaction stays unfinished and is retried in the background.
     @available(iOS 15.0, macOS 12.0, *)
     public func purchase(product: StoreKit.Product) async throws -> PurchaseResult {
-        let api = try requireApi()
-
-        let result: StoreKit.Product.PurchaseResult
-        do {
-            result = try await product.purchase()
-        } catch {
-            throw PurchasesError(error.localizedDescription, code: .storeError)
-        }
-
-        switch result {
-        case .success(let verification):
-            let transaction = try Self.checkVerified(verification)
-            let info = try await Self.validate(
-                transaction: transaction,
-                productId: product.id,
-                appUserId: _appUserId,
-                api: api
-            )
-            await transaction.finish()
-            return PurchaseResult(
-                customerInfo: info,
-                productId: product.id,
-                transactionId: String(transaction.id)
-            )
-        case .userCancelled:
-            throw PurchasesError("User cancelled the purchase", code: .userCancelled)
-        case .pending:
-            throw PurchasesError("Purchase is pending approval", code: .paymentPending)
-        @unknown default:
-            throw PurchasesError("Unknown purchase result", code: .unknown)
-        }
+        try await performPurchase(productId: product.id, product: product, options: StorePurchaseOptions())
     }
 
-    /// Restore purchases: iterate current StoreKit entitlements, validate each with the backend,
-    /// and return the refreshed customer info.
+    /// Purchase by App Store product id (the SDK loads the `StoreKit.Product`).
+    @_disfavoredOverload // `purchases.purchase` keeps meaning purchase(product:)
+    public func purchase(productId: String) async throws -> PurchaseResult {
+        try await performPurchase(productId: productId, product: nil, options: StorePurchaseOptions())
+    }
+
+    /// Purchase a product redeeming a signed promotional offer (see `getPromotionalOffer`).
+    @available(iOS 15.0, macOS 12.0, *)
+    @_disfavoredOverload // `purchases.purchase` keeps meaning purchase(product:)
+    public func purchase(product: StoreKit.Product, promotionalOffer: PromotionalOffer) async throws -> PurchaseResult {
+        try await purchaseRedeeming(productId: product.id, product: product, promotionalOffer: promotionalOffer)
+    }
+
+    /// Purchase a product redeeming a win-back offer from `eligibleWinBackOffers(forProduct:)` (iOS 18+).
+    @available(iOS 18.0, macOS 15.0, *)
+    @_disfavoredOverload // `purchases.purchase` keeps meaning purchase(product:)
+    public func purchase(product: StoreKit.Product, winBackOffer: WinBackOffer) async throws -> PurchaseResult {
+        var options = StorePurchaseOptions()
+        options.winBackOfferId = winBackOffer.id
+        return try await performPurchase(productId: product.id, product: product, options: options)
+    }
+
+    func purchaseRedeeming(productId: String, product: Any?, promotionalOffer: PromotionalOffer) async throws -> PurchaseResult {
+        guard promotionalOffer.productId.isEmpty || promotionalOffer.productId == productId else {
+            throw PurchasesError(
+                "The promotional offer was signed for \(promotionalOffer.productId), not \(productId)",
+                code: .storeError
+            )
+        }
+        var options = StorePurchaseOptions()
+        options.promotionalOffer = promotionalOffer
+        return try await performPurchase(productId: productId, product: product, options: options)
+    }
+
+    /// Restore purchases — the customer's "Restore Purchases": send every verified StoreKit
+    /// entitlement to BillingBear and return the refreshed customer info (see `restoreFromStore`).
+    /// A purchase another subscriber holds follows the project's RestoreTransferPolicy.
     @available(iOS 15.0, macOS 12.0, *)
     @discardableResult
     public func restore() async throws -> CustomerInfo {
-        let api = try requireApi()
-        for await result in StoreKit.Transaction.currentEntitlements {
-            guard case .verified(let transaction) = result else { continue }
-            let validate = ValidateRequest(
-                appUserId: _appUserId,
-                providerType: ProviderType.apple,
-                transactionId: String(transaction.id),
-                originalTransactionId: String(transaction.originalID),
-                productId: transaction.productID
-            )
-            _ = try await api.restorePurchases(appUserId: _appUserId, request: validate)
-        }
-        return try await api.fetchEntitlements(appUserId: _appUserId)
+        try await restoreFromStore(claimOrphanOnly: false)
     }
 
-    @available(iOS 15.0, macOS 12.0, *)
-    private static func validate(
-        transaction: StoreKit.Transaction,
-        productId: String,
-        appUserId: String,
-        api: BillingBearAPI
-    ) async throws -> CustomerInfo {
-        let validate = ValidateRequest(
-            appUserId: appUserId,
-            providerType: ProviderType.apple,
-            transactionId: String(transaction.id),
-            originalTransactionId: String(transaction.originalID),
-            productId: productId
-        )
-        return try await api.validatePurchase(appUserId: appUserId, request: validate)
-    }
-
-    @available(iOS 15.0, macOS 12.0, *)
-    private static func checkVerified<T>(_ result: VerificationResult<T>) throws -> T {
-        switch result {
-        case .unverified:
-            throw PurchasesError("Transaction failed StoreKit verification", code: .storeError)
-        case .verified(let safe):
-            return safe
-        }
+    /// Re-send the device's store purchases to BillingBear without any restore UI (keeping the server
+    /// in sync, e.g. in observer mode). Unlike `restore()` it is a silent sync (`claimOrphanOnly`): it
+    /// adopts purchases parked on an anonymous id but never takes one from another subscriber.
+    @discardableResult
+    public func syncPurchases() async throws -> CustomerInfo {
+        try await restoreFromStore(claimOrphanOnly: true)
     }
 }

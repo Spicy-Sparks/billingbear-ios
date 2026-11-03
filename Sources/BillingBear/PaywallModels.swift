@@ -492,6 +492,179 @@ public struct PaywallResponse: Codable, Equatable, Sendable {
     public let publishedAt: String
     public let document: PaywallDocument
     public let experiment: PaywallExperimentAssignment?
+    /// The exit offer configured on this paywall version: another paywall shown in place when the
+    /// user closes this one without buying. Nil when none is configured, when the server predates
+    /// the feature, or when the payload could not be read (a bad exit offer never breaks the paywall).
+    public let exitOffer: PaywallExitOffer?
+
+    private enum CodingKeys: String, CodingKey {
+        case identifier, versionId, versionNumber, publishedAt, document, experiment, exitOffer
+    }
+
+    init(
+        identifier: String,
+        versionId: String,
+        versionNumber: Int,
+        publishedAt: String,
+        document: PaywallDocument,
+        experiment: PaywallExperimentAssignment? = nil,
+        exitOffer: PaywallExitOffer? = nil
+    ) {
+        self.identifier = identifier
+        self.versionId = versionId
+        self.versionNumber = versionNumber
+        self.publishedAt = publishedAt
+        self.document = document
+        self.experiment = experiment
+        self.exitOffer = exitOffer
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        identifier = try c.decode(String.self, forKey: .identifier)
+        versionId = try c.decode(String.self, forKey: .versionId)
+        versionNumber = try c.decode(Int.self, forKey: .versionNumber)
+        publishedAt = try c.decode(String.self, forKey: .publishedAt)
+        document = try c.decode(PaywallDocument.self, forKey: .document)
+        experiment = try c.decodeIfPresent(PaywallExperimentAssignment.self, forKey: .experiment)
+        // Lenient on purpose: the exit offer is optional decoration of the paywall. A target this
+        // SDK cannot read (an unknown shape, a missing field) leaves it nil instead of failing the
+        // whole response — which would blank the paywall itself, and every offering carrying it.
+        exitOffer = try? c.decodeIfPresent(PaywallExitOffer.self, forKey: .exitOffer)
+    }
+}
+
+// MARK: - Exit offers
+
+/// An exit offer as the SDK receives it: the paywall to show when the user closes the paywall
+/// without purchasing, the offering to buy from, and the frequency cap.
+public struct PaywallExitOffer: Codable, Equatable, Sendable {
+    /// `"paywall"` (another paywall) or `"offering"` (the paywall attached to an offering).
+    public let type: String
+    /// Identifier of the paywall rendered as the exit offer.
+    public let paywallIdentifier: String
+    /// Offering whose packages the exit offer sells: the exit offering, or, for a paywall exit
+    /// offer, a live offering that carries that paywall. Nil means the usual product lookup.
+    public let offeringIdentifier: String?
+    /// Frequency cap: at most this many presentations…
+    public let maxPresentations: Int?
+    /// …within this many seconds. The cap applies only when both are set.
+    public let perPeriodSeconds: Int?
+    /// False when the server already counted `maxPresentations` for this user in the window.
+    /// Nil (an older payload) is treated as eligible.
+    public let eligible: Bool?
+    /// The exit paywall, ready to render. Nil when it could not be read; then nothing is shown.
+    public let paywall: PaywallExitOfferPaywall?
+
+    private enum CodingKeys: String, CodingKey {
+        case type, paywallIdentifier, offeringIdentifier, maxPresentations, perPeriodSeconds, eligible, paywall
+    }
+
+    public init(
+        type: String,
+        paywallIdentifier: String,
+        offeringIdentifier: String? = nil,
+        maxPresentations: Int? = nil,
+        perPeriodSeconds: Int? = nil,
+        eligible: Bool? = nil,
+        paywall: PaywallExitOfferPaywall? = nil
+    ) {
+        self.type = type
+        self.paywallIdentifier = paywallIdentifier
+        self.offeringIdentifier = offeringIdentifier
+        self.maxPresentations = maxPresentations
+        self.perPeriodSeconds = perPeriodSeconds
+        self.eligible = eligible
+        self.paywall = paywall
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        type = (try? c.decodeIfPresent(String.self, forKey: .type)) ?? "paywall"
+        let nested = try? c.decodeIfPresent(PaywallExitOfferPaywall.self, forKey: .paywall)
+        guard let ident = (try? c.decodeIfPresent(String.self, forKey: .paywallIdentifier)) ?? nested?.identifier,
+              !ident.isEmpty else {
+            throw DecodingError.keyNotFound(CodingKeys.paywallIdentifier, .init(
+                codingPath: c.codingPath, debugDescription: "An exit offer needs the paywall it shows."))
+        }
+        paywallIdentifier = ident
+        offeringIdentifier = (try? c.decodeIfPresent(String.self, forKey: .offeringIdentifier))
+            .flatMap { $0.isEmpty ? nil : $0 }
+        maxPresentations = try? c.decodeIfPresent(Int.self, forKey: .maxPresentations)
+        perPeriodSeconds = try? c.decodeIfPresent(Int.self, forKey: .perPeriodSeconds)
+        eligible = try? c.decodeIfPresent(Bool.self, forKey: .eligible)
+        paywall = nested
+    }
+}
+
+/// The exit paywall carried inside an exit offer: its published version, without an experiment
+/// or an exit offer of its own (offers never chain). The document may be a v1 preset document or a
+/// v2 component tree; exactly one of `document` / `tree` is set.
+public struct PaywallExitOfferPaywall: Codable, Equatable, Sendable {
+    public let identifier: String
+    public let versionId: String
+    public let versionNumber: Int
+    public let publishedAt: String
+    /// v1 preset document, when the exit paywall is one.
+    public let document: PaywallDocument?
+    /// v2 component tree, when the exit paywall is one.
+    public let tree: PaywallTree?
+
+    private enum CodingKeys: String, CodingKey { case identifier, versionId, versionNumber, publishedAt, document }
+    private struct VersionProbe: Decodable { let version: Int? }
+
+    public init(
+        identifier: String,
+        versionId: String,
+        versionNumber: Int,
+        publishedAt: String,
+        document: PaywallDocument? = nil,
+        tree: PaywallTree? = nil
+    ) {
+        self.identifier = identifier
+        self.versionId = versionId
+        self.versionNumber = versionNumber
+        self.publishedAt = publishedAt
+        self.document = document
+        self.tree = tree
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        identifier = try c.decode(String.self, forKey: .identifier)
+        versionId = (try? c.decodeIfPresent(String.self, forKey: .versionId)) ?? ""
+        versionNumber = (try? c.decodeIfPresent(Int.self, forKey: .versionNumber)) ?? 0
+        publishedAt = (try? c.decodeIfPresent(String.self, forKey: .publishedAt)) ?? ""
+        let version = (try? c.decodeIfPresent(VersionProbe.self, forKey: .document))?.version ?? 1
+        if version >= 2 {
+            document = nil
+            tree = try c.decode(PaywallTree.self, forKey: .document)
+        } else {
+            document = try c.decode(PaywallDocument.self, forKey: .document)
+            tree = nil
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(identifier, forKey: .identifier)
+        try c.encode(versionId, forKey: .versionId)
+        try c.encode(versionNumber, forKey: .versionNumber)
+        try c.encode(publishedAt, forKey: .publishedAt)
+        if let tree {
+            try c.encode(tree, forKey: .document)
+        } else if let document {
+            try c.encode(document, forKey: .document)
+        }
+    }
+
+    /// The exit paywall as a plain response (v1 only), for the preset renderer and its telemetry.
+    var asResponse: PaywallResponse? {
+        guard let document else { return nil }
+        return PaywallResponse(
+            identifier: identifier, versionId: versionId, versionNumber: versionNumber,
+            publishedAt: publishedAt, document: document)
+    }
 }
 
 // MARK: - Placements
@@ -503,13 +676,42 @@ public struct CampaignDecision: Codable, Equatable, Sendable {
     public let paywallIdentifier: String?
     public let campaignId: String?
     public let ruleReason: String
+    /// Offering for this placement (an offering experiment's variant, else the placement's
+    /// default offering). Pass it to the paywall (`BillingBearPaywall.purchaseOffering(_:)`) so
+    /// purchases buy that offering's packages. Nil on older servers.
+    public let offeringIdentifier: String?
+    /// The experiment cell the user landed in for this placement, for host analytics.
+    public let experimentId: String?
+    public let experimentName: String?
+    public let variant: String?
+    /// Id of the `viewed` exposure the evaluation recorded for the presented paywall.
+    /// `BillingBearPaywall(decision:)` sends it back with the view it records, so the server folds
+    /// that view into this row (one view per presentation). Nil when nothing is presented or on
+    /// older servers.
+    public let presentationId: String?
 
-    public init(present: Bool, paywallId: String?, paywallIdentifier: String?, campaignId: String?, ruleReason: String) {
+    public init(
+        present: Bool,
+        paywallId: String?,
+        paywallIdentifier: String?,
+        campaignId: String?,
+        ruleReason: String,
+        offeringIdentifier: String? = nil,
+        experimentId: String? = nil,
+        experimentName: String? = nil,
+        variant: String? = nil,
+        presentationId: String? = nil
+    ) {
         self.present = present
         self.paywallId = paywallId
         self.paywallIdentifier = paywallIdentifier
         self.campaignId = campaignId
         self.ruleReason = ruleReason
+        self.offeringIdentifier = offeringIdentifier
+        self.experimentId = experimentId
+        self.experimentName = experimentName
+        self.variant = variant
+        self.presentationId = presentationId
     }
 }
 

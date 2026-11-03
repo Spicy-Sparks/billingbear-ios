@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name         = "BillingBear"
-  s.version      = "1.0.0"
+  s.version      = "1.1.0"
   s.summary      = "Native Swift/SwiftUI subscription-management SDK for BillingBear (StoreKit 2)."
   s.description  = <<-DESC
     BillingBear's native iOS SDK — the same Swift sources shipped via Swift Package

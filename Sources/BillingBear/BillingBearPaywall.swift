@@ -37,6 +37,15 @@ public struct BillingBearPaywall: View {
     private let onPurchase: ((PaywallProduct) -> Void)?
     private let onDismiss: (() -> Void)?
 
+    // Set through the modifiers below (`purchaseOffering`, `placementDecision`, `exitOffersEnabled`,
+    // `onPurchaseRequest`) so every existing initializer keeps its exact signature.
+    private(set) var purchaseOfferingIdentifier: String?
+    /// The placement decision that presented this paywall, if any (`init(decision:)`).
+    private(set) var placementPresentation: PaywallPlacementPresentation?
+    private var handlesExitOffers = true
+    private var onPurchaseRequest: ((PaywallPurchaseRequest) async -> PaywallPurchaseOutcome)?
+    private var exitOfferHistory: PaywallExitOfferHistory = .shared
+
     // MARK: Init
 
     /// Render a paywall by identifier — fetched from the dashboard on appear.
@@ -57,6 +66,42 @@ public struct BillingBearPaywall: View {
         self.userContext = userContext
         self.onPurchase = onPurchase
         self.onDismiss = onDismiss
+    }
+
+    /// Render the paywall a placement decision presents (`Purchases.shared.register(_:)`); nil when
+    /// the decision presents nothing. Purchases are looked up in the decision's `offeringIdentifier`
+    /// first (an offering experiment's variant, else the placement's default offering; it reaches the
+    /// host through `onPurchaseRequest(_:)`), and the view is attributed to the evaluation's
+    /// presentation instead of being counted a second time.
+    ///
+    /// Each decision is a new presentation: when a new decision replaces the one on screen, give the
+    /// view a new identity (`.id(decision.presentationId)`) so its exit-offer flow and view start over.
+    ///
+    /// ```swift
+    /// let decision = try await Purchases.shared.register("onboarding_complete")
+    /// if let paywall = BillingBearPaywall(decision: decision, onDismiss: { showPaywall = false }) {
+    ///     paywall.onPurchaseRequest { request in await buy(request) }
+    /// }
+    /// ```
+    public init?(
+        decision: CampaignDecision,
+        variables: [String: String]? = nil,
+        locale: String? = nil,
+        userContext: PaywallUserContext? = nil,
+        onPurchase: ((PaywallProduct) -> Void)? = nil,
+        onDismiss: (() -> Void)? = nil
+    ) {
+        guard let presentation = PaywallPlacementPresentation(decision: decision) else { return nil }
+        self.init(
+            identifier: presentation.paywallIdentifier,
+            variables: variables,
+            locale: locale,
+            userContext: userContext,
+            onPurchase: onPurchase,
+            onDismiss: onDismiss
+        )
+        self.purchaseOfferingIdentifier = decision.offeringIdentifier
+        self.placementPresentation = presentation
     }
 
     /// Render an already-fetched paywall response (carries experiment assignment for telemetry).
@@ -158,6 +203,10 @@ public struct BillingBearPaywall: View {
             // else a bare document — exactly the prior RN-bridge decode order.
             if let response = try? decoder.decode(PaywallResponse.self, from: data) {
                 self.init(response: response, variables: variables, locale: locale, userContext: userContext, onPurchase: onPurchase, onDismiss: onDismiss)
+                // This is the React Native bridge's entry: the JS layer runs the exit-offer flow
+                // (and its telemetry) itself by swapping `documentJson`, so the native view must not
+                // run it a second time.
+                self.handlesExitOffers = false
                 return
             }
             if let document = try? decoder.decode(PaywallDocument.self, from: data) {
@@ -176,12 +225,100 @@ public struct BillingBearPaywall: View {
     @State private var selectedTabId: String?
     @State private var currentPage: Int = 0
     @State private var appeared = false
+    /// This presentation's exit-offer flow: whether the offer is on screen, was shown, was disarmed
+    /// by a purchase or restore, was bought from, or ended (see PaywallExitOfferFlow).
+    @State private var flow = PaywallExitOfferFlow()
+    /// The hosting sheet's swipe-down attempts reach this paywall (see PaywallSheetDismissInterceptor);
+    /// only then is a swipe blocked and routed through the close flow.
+    @State private var interceptsSheetSwipe = false
+
+    // MARK: Modifiers
+
+    /// The offering the paywall's products should be bought from first — pass the placement
+    /// decision's `offeringIdentifier` (an offering experiment's variant or the placement default).
+    /// Reaches the host through `onPurchaseRequest(_:)`.
+    public func purchaseOffering(_ offeringIdentifier: String?) -> BillingBearPaywall {
+        var copy = self
+        copy.purchaseOfferingIdentifier = offeringIdentifier
+        return copy
+    }
+
+    /// Tie a paywall you build yourself (for example from a response you fetched with
+    /// `getPaywall(decision.paywallIdentifier)`) to the placement decision that presents it, as
+    /// `init(decision:)` does: purchases use the decision's offering first, and the view is
+    /// attributed to the evaluation's presentation. Ignored when the decision presents nothing or
+    /// another paywall.
+    public func placementDecision(_ decision: CampaignDecision) -> BillingBearPaywall {
+        guard let presentation = PaywallPlacementPresentation(decision: decision),
+              presentation.paywallIdentifier == identifier else { return self }
+        var copy = self
+        copy.purchaseOfferingIdentifier = decision.offeringIdentifier
+        copy.placementPresentation = presentation
+        return copy
+    }
+
+    /// Turn the dashboard-configured exit offer on or off for this view (on by default). With it on,
+    /// a user close without buying shows the exit offer in place, once, within its frequency cap.
+    /// Presented as a sheet, a swipe-down then goes through the same close: it shows the offer in
+    /// place, and on the offer it performs the final close.
+    public func exitOffersEnabled(_ enabled: Bool) -> BillingBearPaywall {
+        var copy = self
+        copy.handlesExitOffers = enabled
+        return copy
+    }
+
+    /// Receive purchases with their context (which offering to buy from first, which paywall is on
+    /// screen, whether it is an exit offer) and report how they ended. When set it replaces
+    /// `onPurchase`. Only a `.completed` outcome is recorded as a conversion, disarms the source
+    /// paywall's exit offer, or ends an exit-offer flow; after `.cancelled` / `.failed` the paywall
+    /// stays as it was, so a customer who backs out of the store sheet can still close it. The CTA is
+    /// busy while the handler runs.
+    public func onPurchaseRequest(
+        _ handler: @escaping (PaywallPurchaseRequest) async -> PaywallPurchaseOutcome
+    ) -> BillingBearPaywall {
+        var copy = self
+        copy.onPurchaseRequest = handler
+        return copy
+    }
+
+    /// Use another record of exit-offer presentations (tests, a per-account store).
+    func exitOfferHistory(_ history: PaywallExitOfferHistory) -> BillingBearPaywall {
+        var copy = self
+        copy.exitOfferHistory = history
+        return copy
+    }
+
+    private var currentResponse: PaywallResponse? { model.response ?? initialResponse }
+
+    /// Whether the exit offer of `source` may be presented now, before the flow's own state: exit
+    /// offers on, a host close handler, a renderable offer within the server's and the device's cap.
+    private func exitOfferEligible(_ source: PaywallResponse?, now: Date = Date()) -> Bool {
+        guard handlesExitOffers, onDismiss != nil, let source, source.exitOffer != nil else { return false }
+        return PaywallExitOfferLogic.shouldPresent(
+            source.exitOffer,
+            alreadyPresented: flow.exitOfferPresented,
+            presentationTimes: exitOfferHistory.presentations(for: source.identifier),
+            now: now)
+    }
+
+    /// True while a user close would show the exit offer — used to keep the sheet from being swiped
+    /// away, which would skip the offer.
+    private var exitOfferArmed: Bool {
+        flow.isArmed(eligible: exitOfferEligible(currentResponse))
+    }
+
+    /// The exit offer is on screen and not yet bought from or closed: a swipe would skip its close.
+    private var exitOfferPending: Bool {
+        flow.showingExitOffer && !flow.exitPurchased && !flow.ended
+    }
 
     public var body: some View {
         Group {
             if let tree = initialTree {
                 treeContent(tree)
-            } else if let response = model.response ?? initialResponse {
+            } else if flow.showingExitOffer, let exitOffer = flow.activeExitOffer, let exitPaywall = exitOffer.paywall {
+                exitOfferContent(exitOffer, exitPaywall)
+            } else if let response = currentResponse {
                 content(for: response.document, experiment: response.experiment)
             } else if let doc = initialDocument {
                 content(for: doc, experiment: nil)
@@ -204,6 +341,92 @@ public struct BillingBearPaywall: View {
                 await model.loadOrRevalidate(identifier: identifier)
             }
         }
+        .background(sheetDismissInterceptor)
+        .interactiveDismissDisabled(PaywallSheetDismissPolicy.blocksSwipe(
+            armed: exitOfferArmed, pending: exitOfferPending, intercepting: interceptsSheetSwipe))
+    }
+
+    /// Joins the hosting sheet's dismissal (iOS) while this paywall has an exit offer to protect:
+    /// a blocked swipe runs the same close as the close button; a swipe that dismissed is recorded.
+    @ViewBuilder
+    private var sheetDismissInterceptor: some View {
+        #if os(iOS)
+        PaywallSheetDismissInterceptor(
+            active: handlesExitOffers && onDismiss != nil && currentResponse?.exitOffer != nil,
+            onInstalled: { interceptsSheetSwipe = $0 },
+            onAttempt: { dismiss() },
+            onSwipeDismissed: { recordSwipeDismissal() })
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+        #else
+        EmptyView()
+        #endif
+    }
+
+    /// The sheet was swiped away (the swipe was allowed: nothing left to protect). Record the close it
+    /// was, without asking the host to dismiss again — the sheet is already gone.
+    private func recordSwipeDismissal() {
+        // While a purchase is pending the close is held by the flow and settled with the outcome.
+        switch flow.close(source: currentResponse, fallbackIdentifier: identifier, eligible: false, sheetAlreadyGone: true) {
+        case .dismiss(let events):
+            PaywallExposureRecorder.record(events)
+        case .showExitOffer, .ignore:
+            break
+        }
+    }
+
+    // MARK: Exit offer
+
+    /// The exit paywall in place of the source: a v1 document through the preset renderer, a v2
+    /// tree through the tree renderer. It is always closable (an exit paywall whose design hides
+    /// the close control still gets one), and never presents an exit offer of its own.
+    @ViewBuilder
+    private func exitOfferContent(_ exitOffer: PaywallExitOffer, _ exitPaywall: PaywallExitOfferPaywall) -> some View {
+        if let tree = exitPaywall.tree {
+            ZStack(alignment: .topTrailing) {
+                PaywallTreeView(
+                    tree: tree,
+                    variables: variables,
+                    locale: locale,
+                    userContext: userContext,
+                    isSubscribed: nil,
+                    onAction: { action, product in handleExitTreeAction(action, product: product) }
+                )
+                if !tree.hasDismissAction {
+                    closeButton(color: Color.css(tree.theme.textColor, fallback: .white))
+                }
+            }
+        } else if let document = exitPaywall.document {
+            content(for: document, experiment: nil, isExitOffer: true)
+        }
+    }
+
+    private func handleExitTreeAction(_ action: PaywallAction, product: PaywallProduct?) {
+        switch action {
+        case .purchase:
+            guard let product else { return }
+            purchase(product, isExitOffer: true)
+        case .restore:
+            Task { await handleRestore() }
+        case .dismiss:
+            dismiss()
+        case .url(let urlString):
+            open(urlString)
+        case .event, .selectProduct, .nextPage, .prevPage, .goToPage, .unknown:
+            break
+        }
+    }
+
+    private func closeButton(color: Color) -> some View {
+        Button(action: dismiss) {
+            Image(systemName: "xmark")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(color.opacity(0.7))
+                .padding(10)
+        }
+        .padding(.top, 8)
+        .padding(.trailing, 8)
+        .accessibilityLabel("Close")
     }
 
     // MARK: v2 — native tree renderer
@@ -230,10 +453,9 @@ public struct BillingBearPaywall: View {
         switch action {
         case .purchase:
             guard let product else { return }
-            if let identifier {
-                Task { await Purchases.shared.recordExposure(identifier: identifier, outcome: .purchased) }
-            }
-            onPurchase?(product)
+            // The same path as the v1 CTA: `onPurchaseRequest` hosts get the request and confirm it,
+            // legacy `onPurchase` hosts get the product with the `purchased` exposure at the tap.
+            purchase(product, isExitOffer: false)
         case .restore:
             Task { await handleRestore() }
         case .dismiss:
@@ -269,7 +491,7 @@ public struct BillingBearPaywall: View {
     }
 
     @ViewBuilder
-    private func content(for base: PaywallDocument, experiment: PaywallExperimentAssignment?) -> some View {
+    private func content(for base: PaywallDocument, experiment: PaywallExperimentAssignment?, isExitOffer: Bool = false) -> some View {
         let pages = base.pages ?? []
         let isMultiPage = !pages.isEmpty
         let doc = resolved(base)
@@ -295,25 +517,19 @@ public struct BillingBearPaywall: View {
                     .padding(.top, 40)
                 }
 
-                footer(doc: doc, theme: theme, isMultiPage: isMultiPage, isLastPage: isLastPage, pageCount: pages.count)
+                footer(doc: doc, theme: theme, isMultiPage: isMultiPage, isLastPage: isLastPage, pageCount: pages.count, isExitOffer: isExitOffer)
             }
 
-            if showCloseButton(doc) {
-                Button(action: dismiss) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundColor(Color.css(theme.textColor, fallback: .white).opacity(0.7))
-                        .padding(10)
-                }
-                .padding(.top, 8)
-                .padding(.trailing, 8)
-                .accessibilityLabel("Close")
+            // An exit offer is always closable, whatever its design says about the close control.
+            if showCloseButton(doc) || (isExitOffer && onDismiss != nil) {
+                closeButton(color: Color.css(theme.textColor, fallback: .white))
             }
         }
         .onAppear {
             armSelection(doc)
             withAnimation(.easeOut(duration: 0.32)) { appeared = true }
-            recordViewed(experiment)
+            // The exit paywall's `viewed` is recorded when it takes the source's place.
+            if !isExitOffer { recordViewed(experiment) }
         }
     }
 
@@ -346,14 +562,16 @@ public struct BillingBearPaywall: View {
         theme: PaywallTheme,
         isMultiPage: Bool,
         isLastPage: Bool,
-        pageCount: Int
+        pageCount: Int,
+        isExitOffer: Bool = false
     ) -> some View {
         let primary = Color.css(theme.primaryColor, fallback: .accentColor)
         let ctaTextColor = Color.css(theme.ctaTextColor, fallback: .white)
         let textColor = Color.css(theme.textColor, fallback: .white)
         let shape = doc.cta.shape ?? "rounded"
         let radius: CGFloat = shape == "pill" ? 999 : shape == "square" ? 4 : CGFloat(theme.buttonBorderRadius ?? 18)
-        let ctaDisabled = isLastPage && selectedProductId == nil
+        // After a confirmed purchase the CTA stays inert: the purchase latch refuses a second one.
+        let ctaDisabled = (isLastPage && selectedProductId == nil) || flow.purchaseCompleted
 
         VStack(spacing: 8) {
             if isMultiPage {
@@ -367,7 +585,7 @@ public struct BillingBearPaywall: View {
                 .padding(.bottom, 6)
             }
 
-            Button(action: { handleCta(doc: doc, isMultiPage: isMultiPage, isLastPage: isLastPage, pageCount: pageCount) }) {
+            Button(action: { handleCta(doc: doc, isMultiPage: isMultiPage, isLastPage: isLastPage, pageCount: pageCount, isExitOffer: isExitOffer) }) {
                 Text(model.busy ? "Please wait…" : PaywallTransforms.interpolate(doc.cta.text, variables))
                     .font(.system(size: 16, weight: .bold))
                     .foregroundColor(ctaTextColor)
@@ -465,7 +683,7 @@ public struct BillingBearPaywall: View {
         selectedProductId = def?.identifier
     }
 
-    private func handleCta(doc: PaywallDocument, isMultiPage: Bool, isLastPage: Bool, pageCount: Int) {
+    private func handleCta(doc: PaywallDocument, isMultiPage: Bool, isLastPage: Bool, pageCount: Int, isExitOffer: Bool = false) {
         if isMultiPage && !isLastPage {
             withAnimation { currentPage = min(currentPage + 1, pageCount - 1) }
             appeared = false
@@ -474,36 +692,105 @@ public struct BillingBearPaywall: View {
         }
         guard let selectedId = selectedProductId,
               let product = doc.products.first(where: { $0.identifier == selectedId }) else { return }
-        if let identifier {
-            Task { await Purchases.shared.recordExposure(identifier: identifier, outcome: .purchased) }
-        }
-        onPurchase?(product)
+        purchase(product, isExitOffer: isExitOffer)
     }
 
+    /// Hand the product to the host and record what the purchase means for the exposures and the
+    /// exit-offer flow. With `onPurchaseRequest` the outcome is awaited: only a completed purchase is
+    /// recorded (the source's `purchased` with its experiment cell; for an exit offer the exit
+    /// paywall's `purchased` and the source's `exit_offer_purchased`). A legacy `onPurchase` host
+    /// cannot confirm, so a source purchase is recorded at the tap as before and an exit-offer
+    /// purchase records nothing purchase-related.
+    private func purchase(_ product: PaywallProduct, isExitOffer: Bool) {
+        let fromExitOffer = isExitOffer && flow.showingExitOffer
+        let exitOffer = fromExitOffer ? flow.activeExitOffer : nil
+        let shownIdentifier = exitOffer.map { $0.paywall?.identifier ?? $0.paywallIdentifier } ?? identifier
+        let offering = PaywallExitOfferLogic.purchaseOffering(fromExitOffer: exitOffer, sourceOffering: purchaseOfferingIdentifier)
+        let source = currentResponse
+        guard let onPurchaseRequest else {
+            PaywallExposureRecorder.record(flow.purchaseHandedOff(
+                fromExitOffer: fromExitOffer, source: source, fallbackIdentifier: identifier))
+            onPurchase?(product)
+            return
+        }
+        // The purchase latch: one reported purchase at a time, none after a confirmed one or after
+        // the flow ended — checked before the host's billing handler is ever called.
+        guard flow.beginPurchase() else { return }
+        let request = PaywallPurchaseRequest(
+            product: product, offeringIdentifier: offering,
+            paywallIdentifier: shownIdentifier, fromExitOffer: fromExitOffer)
+        model.busy = true
+        Task { @MainActor in
+            let outcome = await onPurchaseRequest(request)
+            model.busy = false
+            PaywallExposureRecorder.record(flow.purchaseFinished(
+                outcome, fromExitOffer: fromExitOffer, source: source, fallbackIdentifier: identifier))
+            // A close made while the purchase was pending: dropped when it sold, run now otherwise.
+            let now = Date()
+            let current = currentResponse
+            if case .close(let action, let dismissHost) = flow.settleHeldClose(
+                after: outcome, source: current, fallbackIdentifier: identifier,
+                eligible: exitOfferEligible(current, now: now)) {
+                apply(action, source: current, now: now, dismissHost: dismissHost)
+            }
+        }
+    }
+
+    /// Restore; a successful restore on the source paywall disarms its exit offer.
     @MainActor
     private func handleRestore() async {
         model.busy = true
         defer { model.busy = false }
-        _ = try? await Purchases.shared.restore()
+        if (try? await Purchases.shared.restore()) != nil {
+            flow.restoreSucceeded()
+        }
     }
 
+    /// The source paywall's `viewed` (see `PaywallViewRecording`: a placement presentation's view
+    /// was recorded by the evaluation and is only re-sent, folded into it, to carry an A/B cell).
     private func recordViewed(_ experiment: PaywallExperimentAssignment?) {
-        guard let identifier else { return }
-        Task {
-            await Purchases.shared.recordExposure(
-                identifier: identifier,
-                outcome: .viewed,
-                experimentId: experiment?.id,
-                variant: experiment?.variant
-            )
-        }
+        guard let identifier,
+              let event = PaywallViewRecording.sourceViewEvent(
+                identifier: identifier, experiment: experiment, presentation: placementPresentation)
+        else { return }
+        PaywallExposureRecorder.record([event])
     }
 
+    /// A user close, run through the flow: on the source it records the dismissal and either
+    /// dismisses or shows the exit offer in place; on the exit offer it ends the flow (its telemetry
+    /// once). After the flow ended, further closes do nothing, so `onDismiss` fires once.
     private func dismiss() {
-        if let identifier {
-            Task { await Purchases.shared.recordExposure(identifier: identifier, outcome: .dismissed) }
+        let now = Date()
+        let source = currentResponse
+        let eligible = exitOfferEligible(source, now: now)
+        // While a reported purchase is pending the flow holds the close (`.ignore`) and the purchase
+        // settles it with its outcome.
+        apply(flow.close(source: source, fallbackIdentifier: identifier, eligible: eligible),
+              source: source, now: now, dismissHost: true)
+    }
+
+    /// Carries out a close decided by the flow. `dismissHost` is false for a close whose sheet is
+    /// already gone (it is only recorded).
+    private func apply(_ action: PaywallExitOfferFlow.CloseAction, source: PaywallResponse?, now: Date, dismissHost: Bool) {
+        switch action {
+        case .ignore:
+            return
+        case .dismiss(let events):
+            PaywallExposureRecorder.record(events)
+            if dismissHost { onDismiss?() }
+        case .showExitOffer(let events):
+            PaywallExposureRecorder.record(events)
+            if let source { exitOfferHistory.recordPresentation(for: source.identifier, at: now) }
+            // The exit paywall starts fresh: its own default selection, first page, entry animation.
+            selectedProductId = nil
+            selectedTabId = nil
+            currentPage = 0
+            appeared = false
+            #if canImport(UIKit)
+            // VoiceOver: the screen content was replaced, move focus to the new paywall.
+            DispatchQueue.main.async { UIAccessibility.post(notification: .screenChanged, argument: nil) }
+            #endif
         }
-        onDismiss?()
     }
 
     private func open(_ urlString: String) {
